@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""
+photofind — query Apple Photos from the terminal.
+
+Reads the Photos library's own SQLite databases directly, read-only. Nothing is
+ever written to the library. Searches Apple's on-device ML scene labels, named
+people, dates, favorites, places, and OCR'd text, then exports previews or
+builds contact sheets so an agent (or a human) can visually triage results.
+
+See README.md for the landmines. The short version:
+  - psi.sqlite strings are NUL-terminated; `=` never matches, always rstrip.
+  - Asset UUIDs are two int64s, little-endian: struct.pack("<qq", uuid_0, uuid_1).
+  - An iCloud-optimized library has almost no originals on disk. Use derivatives.
+  - Apple's labels are COARSE. "cart" means shopping cart. Verify visually.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import shutil
+import sqlite3
+import struct
+import subprocess
+import sys
+import uuid as _uuid
+from collections import Counter
+
+APPLE_EPOCH = 978_307_200  # 2001-01-01 UTC, Core Data reference date
+DEFAULT_LIB = os.path.expanduser("~/Pictures/Photos Library.photoslibrary")
+# Scene-classification categories in psi.sqlite. 1500 = singular, 1501 = plural.
+SCENE_CATEGORIES = (1500, 1501)
+# -label silently no-ops without a resolvable font; annotate with a full path.
+NUMBER_FONT = "/System/Library/Fonts/Helvetica.ttc"
+
+
+def die(msg: str) -> "NoReturn":  # noqa: F821
+    print(f"photofind: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def library_path(explicit: str | None) -> str:
+    lib = explicit or os.environ.get("PHOTOFIND_LIBRARY") or DEFAULT_LIB
+    if not os.path.isdir(lib):
+        die(f"no Photos library at {lib}")
+    return lib
+
+
+def connect(path: str) -> sqlite3.Connection:
+    """Read-only, immutable. Immutable avoids -wal contention with a running Photos.app."""
+    if not os.path.exists(path):
+        die(f"missing database: {path}\nGrant Full Disk Access to your terminal if this looks wrong.")
+    try:
+        return sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+    except sqlite3.OperationalError as exc:
+        die(f"cannot open {path}: {exc}")
+
+
+def db_main(lib: str) -> sqlite3.Connection:
+    return connect(f"{lib}/database/Photos.sqlite")
+
+
+def db_search(lib: str) -> sqlite3.Connection:
+    return connect(f"{lib}/database/search/psi.sqlite")
+
+
+def clean(s: str | None) -> str:
+    """psi.sqlite TEXT columns carry a trailing NUL. Strip it or nothing ever matches."""
+    return (s or "").rstrip("\x00").strip()
+
+
+def uuid_of(u0: int, u1: int) -> str:
+    """Two little-endian int64s -> canonical uppercase UUID, matching ZASSET.ZUUID."""
+    return str(_uuid.UUID(bytes=struct.pack("<qq", u0, u1))).upper()
+
+
+def to_apple(d: dt.datetime) -> float:
+    return d.timestamp() - APPLE_EPOCH
+
+
+def parse_date(s: str) -> dt.datetime:
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            return dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    die(f"cannot parse date {s!r} (use YYYY-MM-DD)")
+
+
+# ---------------------------------------------------------------- label lookup
+
+def label_index(lib: str, wanted: set[str]) -> dict[str, set[str]]:
+    """{asset_uuid: {label, ...}} for assets carrying any of `wanted` (lowercased)."""
+    p = db_search(lib)
+    by_row = {r[0]: uuid_of(r[1], r[2]) for r in p.execute("select rowid, uuid_0, uuid_1 from assets")}
+    hits: dict[str, set[str]] = {}
+    q = f"select rowid, content_string from groups where category in {SCENE_CATEGORIES}"
+    for rowid, raw in p.execute(q):
+        name = clean(raw).lower()
+        if name not in wanted:
+            continue
+        for (asset_row,) in p.execute("select assetid from ga where groupid=?", (rowid,)):
+            u = by_row.get(asset_row)
+            if u:
+                hits.setdefault(u, set()).add(name)
+    return hits
+
+
+def all_labels(lib: str) -> list[tuple[int, str]]:
+    p = db_search(lib)
+    q = f"select rowid, content_string from groups where category in {SCENE_CATEGORIES}"
+    return [(r[0], clean(r[1])) for r in p.execute(q)]
+
+
+# ------------------------------------------------------------------ file paths
+
+def original_path(lib: str, directory: str, filename: str) -> str | None:
+    p = f"{lib}/originals/{directory}/{filename}"
+    return p if os.path.exists(p) else None
+
+
+def preview_path(lib: str, uuid: str) -> str | None:
+    """Largest local derivative. On an optimized library this is usually all there is.
+
+    ⚠️ TWO directories, and missing the second silently erases whole cameras.
+    Camera-roll assets land in derivatives/<first-char>/. RAW files imported from
+    a real camera (Leica .DNG, Fuji .RAF, …) put their renderable JPEG under
+    derivatives/masters/<first-char>/ instead. Globbing only the first path made
+    1,221 of 1,221 Leica frames look like "no preview available" — they were
+    dropped from a 'best photos' pass without a word, which is exactly the kind
+    of silent truncation that reads as 'covered everything'.
+    """
+    hits = glob.glob(f"{lib}/resources/derivatives/{uuid[0]}/{uuid}_*.jpeg")
+    hits += glob.glob(f"{lib}/resources/derivatives/masters/{uuid[0]}/{uuid}_*.jpeg")
+    return max(hits, key=os.path.getsize) if hits else None
+
+
+def best_image(lib: str, row: dict) -> str | None:
+    return original_path(lib, row["directory"], row["filename"]) or preview_path(lib, row["uuid"])
+
+
+# --------------------------------------------------------------------- queries
+
+def resolve_people(lib: str, names: list[str]) -> list[int]:
+    if not names:
+        return []
+    m = db_main(lib)
+    ids: list[int] = []
+    for n in names:
+        found = m.execute(
+            "select Z_PK from ZPERSON where lower(ZFULLNAME) like ?1 or lower(ZDISPLAYNAME) like ?1",
+            (f"%{n.lower()}%",),
+        ).fetchall()
+        if not found:
+            die(f"no person matching {n!r} — run `photofind people` to see names")
+        ids += [r[0] for r in found]
+    return ids
+
+
+def search(lib: str, args) -> list[dict]:
+    m = db_main(lib)
+    where = ["a.ZTRASHEDSTATE = 0"]
+    params: list = []
+
+    if not args.include_videos:
+        where.append("a.ZKIND = 0")
+    if args.favorite:
+        where.append("a.ZFAVORITE = 1")
+    if args.since:
+        where.append(f"a.ZDATECREATED >= {to_apple(parse_date(args.since))}")
+    if args.until:
+        where.append(f"a.ZDATECREATED <= {to_apple(parse_date(args.until))}")
+
+    people = resolve_people(lib, args.person or [])
+    if people:
+        ids = ",".join(str(i) for i in people)
+        clause = (
+            "exists(select 1 from ZDETECTEDFACE f "
+            f"where f.ZASSETFORFACE = a.Z_PK and f.ZPERSONFORFACE in ({ids}))"
+        )
+        if args.all_people and len(args.person) > 1:
+            # every named person must appear, not just one of them
+            per = []
+            for name in args.person:
+                sub = ",".join(str(i) for i in resolve_people(lib, [name]))
+                per.append(
+                    "exists(select 1 from ZDETECTEDFACE f "
+                    f"where f.ZASSETFORFACE = a.Z_PK and f.ZPERSONFORFACE in ({sub}))"
+                )
+            clause = " and ".join(per)
+        where.append(clause)
+
+    label_map: dict[str, set[str]] = {}
+    if args.label:
+        wanted = {l.lower() for l in args.label}
+        label_map = label_index(lib, wanted)
+        if not label_map:
+            die(f"no photos carry any of: {', '.join(sorted(wanted))}\n"
+                f"Run `photofind labels <term>` to see what Apple actually assigns.")
+        m.execute("create temp table _lab(u text primary key)")
+        m.executemany("insert or ignore into _lab values(?)", [(u,) for u in label_map])
+        where.append("a.ZUUID in (select u from _lab)")
+
+    if args.text:
+        # OCR'd / scene text lives in a separate category; fall back gracefully.
+        p = db_search(lib)
+        by_row = {r[0]: uuid_of(r[1], r[2]) for r in p.execute("select rowid, uuid_0, uuid_1 from assets")}
+        needle = args.text.lower()
+        matched = set()
+        for rowid, raw in p.execute("select rowid, content_string from groups"):
+            if needle in clean(raw).lower():
+                for (ar,) in p.execute("select assetid from ga where groupid=?", (rowid,)):
+                    if ar in by_row:
+                        matched.add(by_row[ar])
+        if not matched:
+            die(f"nothing matched text {args.text!r}")
+        m.execute("create temp table _txt(u text primary key)")
+        m.executemany("insert or ignore into _txt values(?)", [(u,) for u in matched])
+        where.append("a.ZUUID in (select u from _txt)")
+
+    if getattr(args, "explain", False):
+        # An empty result is ambiguous: bad filter, or a true fact about the library?
+        # Show each predicate's standalone count, then the running intersection, so the
+        # exact filter that zeroes it out is obvious. (Written after nearly "fixing" a
+        # correct empty result — the dog's photos genuinely predate the date window.)
+        print("filter breakdown:", file=sys.stderr)
+        running: list[str] = []
+        for w in where:
+            alone = m.execute(f"select count(*) from ZASSET a where {w}").fetchone()[0]
+            running.append(w)
+            both = m.execute(
+                f"select count(*) from ZASSET a where {' and '.join(running)}"
+            ).fetchone()[0]
+            label = w if len(w) <= 68 else w[:65] + "..."
+            print(f"  {alone:>9,} alone  {both:>9,} cumulative   {label}", file=sys.stderr)
+        print(file=sys.stderr)
+
+    sql = f"""
+        select a.ZUUID,
+               datetime(a.ZDATECREATED + {APPLE_EPOCH}, 'unixepoch', 'localtime'),
+               a.ZDIRECTORY, a.ZFILENAME, a.ZFAVORITE, a.ZKIND,
+               round(a.ZLATITUDE, 5), round(a.ZLONGITUDE, 5),
+               (select group_concat(distinct p.ZFULLNAME)
+                  from ZDETECTEDFACE f join ZPERSON p on p.Z_PK = f.ZPERSONFORFACE
+                 where f.ZASSETFORFACE = a.Z_PK and p.ZFULLNAME is not null)
+          from ZASSET a
+         where {' and '.join(where)}
+         order by a.ZDATECREATED
+    """
+    rows = []
+    for r in m.execute(sql):
+        lat, lon = r[6], r[7]
+        rows.append({
+            "uuid": r[0], "date": r[1], "directory": r[2], "filename": r[3],
+            "favorite": bool(r[4]), "video": r[5] != 0,
+            "lat": None if lat in (None, -180.0) else lat,
+            "lon": None if lon in (None, -180.0) else lon,
+            "people": [x for x in (r[8] or "").split(",") if x],
+            "labels": sorted(label_map.get(r[0], [])),
+        })
+    if args.limit:
+        rows = rows[: args.limit]
+    return rows
+
+
+# --------------------------------------------------------------------- outputs
+
+def export(lib: str, rows: list[dict], outdir: str, size: int, prefix: str = "") -> list[str]:
+    os.makedirs(outdir, exist_ok=True)
+    written = []
+    for i, r in enumerate(rows, 1):
+        src = best_image(lib, r)
+        if not src:
+            continue
+        stem = f"{prefix}{i:03d}_{r['date'][:10]}"
+        dst = os.path.join(outdir, f"{stem}.jpg")
+        res = subprocess.run(["sips", "-s", "format", "jpeg", "-Z", str(size), src, "--out", dst],
+                             capture_output=True)
+        if res.returncode == 0:
+            written.append(dst)
+    return written
+
+
+def contact_sheets(lib: str, rows: list[dict], outdir: str, per: int, tile: int,
+                   cell: int, number: bool = True) -> list[str]:
+    """Tile previews into scannable grids. THE way to triage a big result set visually.
+
+    Every tile is stamped with its global index so a human can say "keep 4, 17, also
+    look again at 62" and the numbers resolve straight back through index.json.
+    """
+    if not shutil.which("montage"):
+        die("ImageMagick not installed — run: brew install imagemagick")
+    stage = os.path.join(outdir, "tiles")
+    shutil.rmtree(outdir, ignore_errors=True)
+    os.makedirs(stage)
+
+    staged: list[tuple[str, dict]] = []
+    for r in rows:
+        src = best_image(lib, r)
+        if not src:
+            continue
+        # Copy to a space-free path: montage's @list and some delegates choke on
+        # "Photos Library.photoslibrary" (the space splits the filename).
+        dst = os.path.join(stage, f"{len(staged):05d}.jpg")
+        shutil.copyfile(src, dst)
+        staged.append((dst, r))
+
+    with open(os.path.join(outdir, "index.json"), "w") as fh:
+        json.dump([{"n": i, **{k: v for k, v in r.items()
+                               if k not in ("directory", "filename")}}
+                   for i, (_, r) in enumerate(staged)], fh, indent=1, default=str)
+
+    # Numbered, uniformly-sized tiles. -label needs a font ImageMagick can resolve
+    # and silently fails without one ("unable to read font ''"), so annotate
+    # explicitly with a full path to a system font instead.
+    numbered = []
+    for i, (src, meta) in enumerate(staged):
+        out = os.path.join(stage, f"n{i:05d}.jpg")
+        cmd = ["magick", src, "-resize", f"{cell}x{cell}^",
+               "-gravity", "center", "-extent", f"{cell}x{cell}"]
+        if number:
+            cmd += ["-font", NUMBER_FONT, "-pointsize", str(max(16, cell // 11)),
+                    "-fill", "white", "-undercolor", "#000000c0",
+                    "-gravity", "northwest", "-annotate", "+5+3",
+                    f" {i}{' *' if meta.get('favorite') else ''} "]
+        cmd.append(out)
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            numbered.append(out)
+        else:
+            numbered.append(src)
+
+    sheets = []
+    for n in range(0, len(numbered), per):
+        out = os.path.join(outdir, f"sheet_{n // per:02d}.jpg")
+        res = subprocess.run(
+            # montage resolves a font even with labels off and dies on an empty
+            # one — pass it explicitly, and Concatenate to suppress label frames.
+            ["montage", *numbered[n : n + per], "-mode", "Concatenate",
+             "-font", NUMBER_FONT, "-tile", f"{tile}x",
+             "-background", "#111", "-geometry", "+3+3", out],
+            capture_output=True,
+        )
+        if res.returncode == 0:
+            sheets.append(out)
+        else:
+            print(f"  montage failed: {res.stderr.decode()[:160]}", file=sys.stderr)
+    return sheets
+
+
+def render(rows: list[dict], fmt: str) -> None:
+    if fmt == "json":
+        print(json.dumps(rows, indent=1))
+        return
+    if fmt == "uuid":
+        for r in rows:
+            print(r["uuid"])
+        return
+    for r in rows:
+        bits = [r["date"], r["uuid"][:8]]
+        if r["favorite"]:
+            bits.append("★")
+        if r["video"]:
+            bits.append("[video]")
+        if r["labels"]:
+            bits.append("{" + ",".join(r["labels"]) + "}")
+        if r["people"]:
+            bits.append(", ".join(r["people"]))
+        if r["lat"] is not None:
+            bits.append(f"@{r['lat']},{r['lon']}")
+        print("  ".join(bits))
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_labels(lib: str, args) -> None:
+    term = (args.term or "").lower()
+    seen = Counter()
+    for _, name in all_labels(lib):
+        if not term or term in name.lower():
+            seen[name] += 1
+    if not seen:
+        print(f"no scene labels matching {args.term!r}")
+        print("Apple's vocabulary is fixed and coarse — try a broader word.")
+        return
+    for name in sorted(seen):
+        print(name)
+    print(f"\n{len(seen)} label(s). These are Apple's own on-device scene tags.", file=sys.stderr)
+
+
+def cmd_people(lib: str, args) -> None:
+    m = db_main(lib)
+    q = """select p.ZFULLNAME, p.ZDISPLAYNAME, count(f.Z_PK)
+             from ZPERSON p left join ZDETECTEDFACE f on f.ZPERSONFORFACE = p.Z_PK
+            where p.ZFULLNAME is not null
+            group by p.Z_PK order by 3 desc"""
+    agg = Counter()
+    for full, _disp, n in m.execute(q):
+        agg[full] += n
+    for name, n in agg.most_common(args.limit):
+        print(f"{n:>6}  {name}")
+
+
+def cmd_search(lib: str, args) -> None:
+    rows = search(lib, args)
+    print(f"{len(rows)} match(es)", file=sys.stderr)
+    render(rows, args.format)
+    if args.out:
+        written = export(lib, rows, args.out, args.size)
+        print(f"exported {len(written)} -> {args.out}", file=sys.stderr)
+
+
+def cmd_sheet(lib: str, args) -> None:
+    rows = search(lib, args)
+    print(f"{len(rows)} match(es)", file=sys.stderr)
+    if not rows:
+        return
+    sheets = contact_sheets(lib, rows, args.out, args.per, args.tile, args.cell,
+                                number=not args.no_number)
+    for s in sheets:
+        print(s)
+    print(f"\n{len(sheets)} sheet(s) in {args.out}", file=sys.stderr)
+    print(f"Tiles are numbered; look them up in {args.out}/index.json.", file=sys.stderr)
+
+
+def cmd_export(lib: str, args) -> None:
+    m = db_main(lib)
+    rows = []
+    for u in args.uuid:
+        r = m.execute(
+            f"""select ZUUID, datetime(ZDATECREATED + {APPLE_EPOCH}, 'unixepoch', 'localtime'),
+                       ZDIRECTORY, ZFILENAME
+                  from ZASSET where ZUUID = ? or ZUUID like ?""",
+            (u.upper(), u.upper() + "%"),
+        ).fetchone()
+        if not r:
+            print(f"  no asset {u}", file=sys.stderr)
+            continue
+        rows.append({"uuid": r[0], "date": r[1], "directory": r[2], "filename": r[3]})
+    written = export(lib, rows, args.out, args.size)
+    for w in written:
+        print(w)
+
+
+# Apple scores every asset on ~25 aesthetic axes. ZOVERALLAESTHETICSCORE is its
+# headline number, and it is essentially a face detector with a bokeh bonus — a
+# tight, centred, well-lit close-up scores near the top almost regardless of
+# whether the picture is interesting. The weights below deliberately re-balance
+# toward subject interest and timing, and penalise clutter and technical failure.
+# It is still only a CANDIDATE RANKER. Run `sheet` on the output and curate by eye.
+BEST_WEIGHTS = {
+    "ZOVERALLAESTHETICSCORE": 2.2, "ZCURATIONSCORE": 1.0, "ZICONICSCORE": 0.8,
+    "c.ZINTERESTINGSUBJECTSCORE": 0.9, "c.ZWELLTIMEDSHOTSCORE": 0.7,
+    "c.ZPLEASANTCOMPOSITIONSCORE": 0.6, "c.ZPLEASANTLIGHTINGSCORE": 0.5,
+    "c.ZSHARPLYFOCUSEDSUBJECTSCORE": 0.4, "c.ZHARMONIOUSCOLORSCORE": 0.3,
+    "c.ZFAILURESCORE": -0.8, "c.ZINTRUSIVEOBJECTPRESENCESCORE": -0.5,
+    "c.ZNOISESCORE": -0.3,
+}
+
+
+def cmd_best(lib: str, args) -> None:
+    m = db_main(lib)
+    where = ["a.ZKIND = 0", "a.ZTRASHEDSTATE = 0"]
+    if args.since:
+        where.append(f"a.ZDATECREATED >= {to_apple(parse_date(args.since))}")
+    if args.until:
+        where.append(f"a.ZDATECREATED <= {to_apple(parse_date(args.until))}")
+    if getattr(args, "favorites_only", False):
+        where.append("a.ZFAVORITE = 1")
+    people = resolve_people(lib, args.person or [])
+    if people:
+        ids = ",".join(str(i) for i in people)
+        where.append("exists(select 1 from ZDETECTEDFACE f "
+                     f"where f.ZASSETFORFACE = a.Z_PK and f.ZPERSONFORFACE in ({ids}))")
+
+    expr = " + ".join(
+        f"({w} * coalesce({'a.' + col if not col.startswith('c.') else col}, 0))"
+        for col, w in BEST_WEIGHTS.items()
+    )
+    rows = m.execute(f"""
+        select a.ZUUID, datetime(a.ZDATECREATED + {APPLE_EPOCH}, 'unixepoch', 'localtime'),
+               a.ZDIRECTORY, a.ZFILENAME, a.ZFAVORITE, round({expr}, 4) score,
+               x.ZORIGINALFILENAME
+          from ZASSET a left join ZCOMPUTEDASSETATTRIBUTES c on c.ZASSET = a.Z_PK
+               left join ZADDITIONALASSETATTRIBUTES x on x.ZASSET = a.Z_PK
+         where {' and '.join(where)}
+         order by score desc
+    """).fetchall()
+
+    scored = [{"uuid": r[0], "date": r[1], "directory": r[2], "filename": r[3],
+               "favorite": bool(r[4]), "score": r[5], "video": False,
+               "original": r[6], "camera": camera_of(r[6]),
+               "people": [], "labels": [], "lat": None, "lon": None} for r in rows]
+
+    # Ranking without a preview is useless — you cannot curate what you cannot see.
+    viewable = [r for r in scored if best_image(lib, r)]
+    print(f"{len(scored):,} in window · {len(viewable):,} have a local preview", file=sys.stderr)
+    if len(viewable) < len(scored) * 0.5:
+        print("NOTE: over half have no local preview (iCloud-optimized library).",
+              file=sys.stderr)
+        print("      Ranking is over what is visible here, not the whole window.",
+              file=sys.stderr)
+
+    counts = Counter(r["camera"] for r in viewable)
+    favs = Counter(r["camera"] for r in viewable if r["favorite"])
+    print("  by camera: " + " · ".join(
+        f"{k} {v:,} ({100 * favs.get(k, 0) / max(v, 1):.0f}% faved)"
+        for k, v in counts.most_common()), file=sys.stderr)
+
+    # Stratify. iPhone volume otherwise buries the deliberate cameras entirely —
+    # a naive top-N is ~95% snapshots. See taste.md.
+    pool, seen = [], set()
+    if not args.no_stratify:
+        for cam, quota in (("Leica", args.pool // 3), ("Ricoh", args.pool // 4),
+                           ("Fuji", args.pool // 7)):
+            for r in [x for x in viewable if x["camera"] == cam][:quota]:
+                pool.append(r); seen.add(r["uuid"])
+    for r in viewable:
+        if len(pool) >= args.pool:
+            break
+        if r["uuid"] not in seen:
+            pool.append(r); seen.add(r["uuid"])
+    pool.sort(key=lambda r: -r["score"])
+    if not args.no_stratify:
+        print("  pool:      " + " · ".join(
+            f"{k} {v}" for k, v in Counter(r["camera"] for r in pool).most_common()),
+            file=sys.stderr)
+    if args.sheet:
+        sheets = contact_sheets(lib, pool, args.out, args.per, args.tile, args.cell,
+                                number=not args.no_number)
+        for s in sheets:
+            print(s)
+        print(f"\n{len(sheets)} sheet(s) of the top {len(pool)} in {args.out}", file=sys.stderr)
+        print("Apple's score is a CANDIDATE RANKER, not taste — pick by eye from here.",
+              file=sys.stderr)
+        print("Run `photofind taste` for the curation rubric before selecting.",
+              file=sys.stderr)
+    else:
+        render(pool[: args.limit or 20], args.format)
+
+
+def cmd_reveal(lib: str, args) -> None:
+    """Open an asset in Photos.app so the human can export full resolution."""
+    script = f'''
+    tell application "Photos"
+        activate
+        set target to (every media item whose id starts with "{args.uuid.upper()}")
+        if (count of target) > 0 then spotlight (item 1 of target)
+    end tell'''
+    subprocess.run(["osascript", "-e", script])
+
+
+def cmd_taste(lib: str, args) -> None:
+    """Print the curation rubric. Read this BEFORE selecting anyone's 'best' photos."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "taste.md")
+    if not os.path.exists(path):
+        die("taste.md not found next to photofind")
+    with open(path) as fh:
+        sys.stdout.write(fh.read())
+
+
+CAMERA_PREFIXES = [("Leica", ("L100",)), ("Fuji", ("DSCF",)), ("iPhone", ("IMG_", "2026"))]
+
+
+def camera_of(filename: str | None) -> str:
+    fn = filename or ""
+    if "R000" in fn:
+        return "Ricoh"
+    for name, prefixes in CAMERA_PREFIXES:
+        if fn.startswith(prefixes):
+            return name
+    return "other"
+
+
+def cmd_doctor(lib: str, args) -> None:
+    print(f"library         {lib}")
+    m = db_main(lib)
+    total, = m.execute("select count(*) from ZASSET where ZKIND=0 and ZTRASHEDSTATE=0").fetchone()
+    newest, = m.execute(
+        f"select datetime(max(ZDATECREATED)+{APPLE_EPOCH},'unixepoch','localtime') from ZASSET"
+    ).fetchone()
+    originals = sum(1 for _ in glob.iglob(f"{lib}/originals/*/*"))
+    previews = sum(1 for _ in glob.iglob(f"{lib}/resources/derivatives/*/*.jpeg"))
+    people, = m.execute("select count(*) from ZPERSON where ZFULLNAME is not null").fetchone()
+    labels = len({n for _, n in all_labels(lib)})
+    print(f"stills          {total:,}")
+    print(f"newest asset    {newest}")
+    print(f"originals local {originals:,}")
+    print(f"previews local  {previews:,}")
+    print(f"named people    {people:,}")
+    print(f"scene labels    {labels:,}")
+    print(f"imagemagick     {'yes' if shutil.which('montage') else 'NO — brew install imagemagick'}")
+    if originals < total * 0.2:
+        print("\nNOTE: library is iCloud-optimized. Most originals are not on disk;")
+        print("      photofind will fall back to ~1024px previews. Use `reveal` to")
+        print("      open an asset in Photos.app and export full resolution.")
+    if newest:
+        lag = dt.datetime.now() - dt.datetime.fromisoformat(newest)
+        if lag > dt.timedelta(hours=2):
+            print(f"\nNOTE: newest asset is {lag.days}d {lag.seconds//3600}h old — iCloud sync may be behind.")
+            print("      Very recent photos may not be searchable yet.")
+
+
+# -------------------------------------------------------------------- argparse
+
+def add_filters(sp) -> None:
+    sp.add_argument("--label", "-l", action="append", help="Apple scene label (repeatable, OR'd)")
+    sp.add_argument("--person", "-p", action="append", help="person name, substring match (repeatable)")
+    sp.add_argument("--all-people", action="store_true", help="require EVERY --person, not any")
+    sp.add_argument("--text", "-t", help="substring of OCR'd / indexed text")
+    sp.add_argument("--since", help="YYYY-MM-DD")
+    sp.add_argument("--until", help="YYYY-MM-DD")
+    sp.add_argument("--favorite", action="store_true", help="favorites only")
+    sp.add_argument("--include-videos", action="store_true")
+    sp.add_argument("--limit", type=int, default=0)
+    sp.add_argument("--explain", action="store_true",
+                    help="show per-filter and cumulative counts — use this whenever a "
+                         "result is empty or surprisingly small, BEFORE assuming a bug")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="photofind",
+        description="Query Apple Photos from the terminal (read-only).",
+        epilog="Apple's scene labels are coarse — 'cart' means shopping cart. "
+               "Always verify visually with `sheet` before trusting a result set.",
+    )
+    ap.add_argument("--library", help="path to .photoslibrary (default: ~/Pictures, or $PHOTOFIND_LIBRARY)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("search", help="find photos, print or export them")
+    add_filters(s)
+    s.add_argument("--format", "-f", choices=("text", "json", "uuid"), default="text")
+    s.add_argument("--out", "-o", help="also export previews to this directory")
+    s.add_argument("--size", type=int, default=1600)
+    s.set_defaults(fn=cmd_search)
+
+    s = sub.add_parser("sheet", help="build contact sheets for visual triage")
+    add_filters(s)
+    s.add_argument("--out", "-o", default="/tmp/photofind")
+    s.add_argument("--per", type=int, default=48, help="photos per sheet")
+    s.add_argument("--tile", type=int, default=8, help="columns")
+    s.add_argument("--cell", type=int, default=240, help="cell pixels")
+    s.add_argument("--no-number", action="store_true", help="omit tile numbers")
+    s.set_defaults(fn=cmd_sheet)
+
+    s = sub.add_parser("best", help="rank by Apple's aesthetic scores (a candidate ranker, not taste)")
+    s.add_argument("--since")
+    s.add_argument("--until")
+    s.add_argument("--person", "-p", action="append")
+    s.add_argument("--pool", type=int, default=240, help="candidates to consider/sheet")
+    s.add_argument("--no-stratify", action="store_true",
+                   help="skip per-camera quotas (iPhone volume will dominate)")
+    s.add_argument("--favorites-only", action="store_true",
+                   help="only photos Alex starred (a real but INCOMPLETE signal — "
+                        "he does not always get around to favoriting)")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--sheet", action="store_true", help="build contact sheets of the pool")
+    s.add_argument("--out", "-o", default="/tmp/photofind-best")
+    s.add_argument("--per", type=int, default=36)
+    s.add_argument("--tile", type=int, default=6)
+    s.add_argument("--cell", type=int, default=330)
+    s.add_argument("--no-number", action="store_true")
+    s.add_argument("--format", "-f", choices=("text", "json", "uuid"), default="text")
+    s.set_defaults(fn=cmd_best)
+
+    s = sub.add_parser("labels", help="list Apple's scene labels (optionally filtered)")
+    s.add_argument("term", nargs="?")
+    s.set_defaults(fn=cmd_labels)
+
+    s = sub.add_parser("people", help="list named people by face count")
+    s.add_argument("--limit", type=int, default=60)
+    s.set_defaults(fn=cmd_people)
+
+    s = sub.add_parser("export", help="export specific assets by UUID (prefix ok)")
+    s.add_argument("uuid", nargs="+")
+    s.add_argument("--out", "-o", default="/tmp/photofind-export")
+    s.add_argument("--size", type=int, default=1600)
+    s.set_defaults(fn=cmd_export)
+
+    s = sub.add_parser("reveal", help="open an asset in Photos.app (for full-res export)")
+    s.add_argument("uuid")
+    s.set_defaults(fn=cmd_reveal)
+
+    s = sub.add_parser("taste", help="print the curation rubric (read before any 'best' selection)")
+    s.set_defaults(fn=cmd_taste)
+
+    s = sub.add_parser("doctor", help="library health + what photofind can and cannot see")
+    s.set_defaults(fn=cmd_doctor)
+
+    args = ap.parse_args()
+    args.fn(library_path(args.library), args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
