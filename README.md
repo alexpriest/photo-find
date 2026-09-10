@@ -1,8 +1,14 @@
 # photofind
 
-Query Apple Photos from the terminal. Read-only, no dependencies beyond the
-standard library plus `sips` (built into macOS) and `montage` (ImageMagick,
-optional, for contact sheets).
+Queries Apple Photos from the terminal, read-only, and renders what it found as a contact sheet.
+
+## Status
+
+Shipped — read-only against the local Apple Photos library.
+
+## License
+
+Not licensed for reuse.
 
 Built 2026-07-28 while hunting for photos of the kids riding in the Bunch Bike.
 It found them. The lessons from that hunt are baked in below — read the
